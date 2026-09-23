@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CFG="${CODEX_AUTOMATION_CONFIG:-$HOME/.config/codex-automation/config.env}"
+[[ -f "$CFG" ]] || { echo "Config not found: $CFG" >&2; exit 2; }
+# shellcheck disable=SC1090
+source "$CFG"
+
+: "${TARGET_REPO:?TARGET_REPO is required}"
+: "${BASE_BRANCH:=main}"
+: "${MODEL:=gpt-6-luna}"
+: "${DISCOVERY_STOP:=06:15}"
+: "${WRAP_START:=06:30}"
+: "${HARD_STOP:=07:00}"
+: "${QUEUE_LABEL:=nightly}"
+: "${MAX_ISSUES_PER_NIGHT:=4}"
+: "${MAX_DISCOVERY_ISSUES:=5}"
+: "${AUTO_QUEUE_DISCOVERIES:=false}"
+: "${VALIDATE_CMD:=true}"
+: "${CODEX_SANDBOX:=workspace-write}"
+: "${CODEX_APPROVAL_POLICY:=never}"
+: "${WORK_ROOT:=$HOME/.local/share/codex-automation}"
+: "${STATE_ROOT:=$HOME/.local/state/codex-automation}"
+: "${EXTRA_INSTRUCTIONS:=}"
+
+for cmd in git gh codex jq timeout; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "Missing command: $cmd" >&2; exit 2; }
+done
+
+gh auth status >/dev/null 2>&1 || { echo "gh is not authenticated" >&2; exit 2; }
+codex login status >/dev/null 2>&1 || { echo "codex is not authenticated" >&2; exit 2; }
+
+slug="${TARGET_REPO//\//__}"
+repo_dir="$WORK_ROOT/repos/$TARGET_REPO"
+mkdir -p "$(dirname "$repo_dir")" "$STATE_ROOT"
+
+now_epoch="$(date +%s)"
+today_hard="$(date -d "today $HARD_STOP" +%s)"
+if (( now_epoch >= today_hard )); then
+  hard_epoch="$(date -d "tomorrow $HARD_STOP" +%s)"
+  discovery_epoch="$(date -d "tomorrow $DISCOVERY_STOP" +%s)"
+  wrap_epoch="$(date -d "tomorrow $WRAP_START" +%s)"
+else
+  hard_epoch="$today_hard"
+  discovery_epoch="$(date -d "today $DISCOVERY_STOP" +%s)"
+  wrap_epoch="$(date -d "today $WRAP_START" +%s)"
+fi
+
+night_date="$(date -d "@$hard_epoch" +%F)"
+run_dir="$STATE_ROOT/nightly-$night_date"
+mkdir -p "$run_dir"
+run_log="$run_dir/run.log"
+report="$run_dir/NIGHTLY_REPORT.md"
+processed="$run_dir/processed.txt"
+touch "$processed"
+
+exec > >(tee -a "$run_log") 2>&1
+
+log() { printf '[%s] %s\n' "$(date --iso-8601=seconds)" "$*"; }
+remaining() { echo $((hard_epoch - $(date +%s))); }
+before() { (( $(date +%s) < $1 )); }
+
+cleanup() {
+  log "runner exiting"
+  jobs -pr | xargs -r kill -TERM 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+log "night=$night_date repo=$TARGET_REPO model=$MODEL hard_stop=$(date -d "@$hard_epoch" --iso-8601=seconds)"
+
+if [[ ! -d "$repo_dir/.git" ]]; then
+  log "cloning $TARGET_REPO"
+  git clone "https://github.com/$TARGET_REPO.git" "$repo_dir"
+fi
+
+cd "$repo_dir"
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  log "workspace has uncommitted changes; refusing to continue"
+  exit 3
+fi
+
+git fetch --prune origin
+git checkout "$BASE_BRANCH"
+git reset --hard "origin/$BASE_BRANCH"
+
+# Labels are idempotent. Color is intentionally neutral.
+ensure_label() {
+  gh label create "$1" --repo "$TARGET_REPO" --color "6e7781" --description "$2" 2>/dev/null || true
+}
+ensure_label "$QUEUE_LABEL" "Eligible for the nightly coding agent"
+ensure_label "nightly:pr-open" "Nightly agent opened a draft PR"
+ensure_label "nightly:blocked" "Nightly agent could not finish safely"
+ensure_label "nightly:discovered" "Found automatically during nightly discovery"
+
+implemented=0
+blocked=0
+created_issues=0
+
+render_prompt() {
+  local issue_json="$1"
+  local template="$HOME/.local/share/codex-automation/nightly.md"
+  if [[ ! -f "$template" ]]; then
+    template="$WORK_ROOT/nightly.md"
+  fi
+  local body
+  body="$(cat "$template")"
+  body="${body//\{\{ISSUE\}\}/$issue_json}"
+  printf '%s\n\nAdditional local instructions:\n%s\n' "$body" "$EXTRA_INSTRUCTIONS"
+}
+
+run_codex() {
+  local prompt="$1" name="$2"
+  local secs
+  secs="$(remaining)"
+  (( secs > 0 )) || return 124
+
+  timeout --signal=TERM --kill-after=120s "${secs}s"     codex exec       --json       --sandbox "$CODEX_SANDBOX"       --ask-for-approval "$CODEX_APPROVAL_POLICY"       -m "$MODEL"       "$prompt"       > >(tee -a "$run_dir/codex-$name.jsonl")       2> >(tee -a "$run_dir/codex-$name.stderr.log" >&2)
+}
+
+publish_issue_work() {
+  local num="$1" title="$2"
+  local branch_name="nightly/$night_date/issue-$num"
+
+  git checkout "$BASE_BRANCH"
+  git reset --hard "origin/$BASE_BRANCH"
+  git branch -D "$branch_name" 2>/dev/null || true
+  git checkout -b "$branch_name"
+
+  mkdir -p .codex-automation
+  printf '{"items":[]}\n' > .codex-automation/discoveries.json
+
+  local issue_json
+  issue_json="$(gh issue view "$num" --repo "$TARGET_REPO" --json number,title,body,labels,url)"
+  local prompt
+  prompt="$(render_prompt "$issue_json")"
+
+  log "issue #$num: $title"
+  if ! run_codex "$prompt" "issue-$num"; then
+    log "codex failed/timed out on issue #$num"
+    gh issue edit "$num" --repo "$TARGET_REPO" --remove-label "$QUEUE_LABEL" --add-label "nightly:blocked" || true
+    blocked=$((blocked + 1))
+    git reset --hard
+    git clean -fd .codex-automation
+    return
+  fi
+
+  if git diff --quiet && git diff --cached --quiet; then
+    log "issue #$num produced no changes"
+    gh issue edit "$num" --repo "$TARGET_REPO" --remove-label "$QUEUE_LABEL" --add-label "nightly:blocked" || true
+    blocked=$((blocked + 1))
+    return
+  fi
+
+  log "validating issue #$num with: $VALIDATE_CMD"
+  if ! bash -lc "$VALIDATE_CMD"; then
+    log "validation failed for issue #$num"
+    gh issue edit "$num" --repo "$TARGET_REPO" --remove-label "$QUEUE_LABEL" --add-label "nightly:blocked" || true
+    blocked=$((blocked + 1))
+    git diff > "$run_dir/issue-$num-failed.patch" || true
+    git reset --hard
+    git clean -fd .codex-automation
+    return
+  fi
+
+  rm -rf .codex-automation
+  git add -A
+  git commit -m "nightly: implement #$num"
+  git push -u origin "$branch_name"
+
+  pr_url="$(gh pr create     --repo "$TARGET_REPO"     --base "$BASE_BRANCH"     --head "$branch_name"     --draft     --title "nightly: #$num $title"     --body "Automated overnight implementation for #$num.
+
+Validation:
+\`\`\`
+$VALIDATE_CMD
+\`\`\`
+
+This PR is intentionally draft and was not merged automatically.")"
+
+  gh issue comment "$num" --repo "$TARGET_REPO" --body "Nightly agent opened draft PR: $pr_url" || true
+  gh issue edit "$num" --repo "$TARGET_REPO" --remove-label "$QUEUE_LABEL" --add-label "nightly:pr-open" || true
+  implemented=$((implemented + 1))
+}
+
+while before "$wrap_epoch" && (( implemented + blocked < MAX_ISSUES_PER_NIGHT )); do
+  issue_line="$(gh issue list     --repo "$TARGET_REPO"     --state open     --label "$QUEUE_LABEL"     --limit 50     --json number,title     --jq '.[] | [.number,.title] | @tsv'     | while IFS=$'\t' read -r n t; do
+        grep -qx "$n" "$processed" || { printf '%s\t%s\n' "$n" "$t"; break; }
+      done)"
+
+  [[ -n "$issue_line" ]] || break
+  IFS=$'\t' read -r issue_num issue_title <<<"$issue_line"
+  echo "$issue_num" >> "$processed"
+  publish_issue_work "$issue_num" "$issue_title"
+
+  git checkout "$BASE_BRANCH"
+  git reset --hard "origin/$BASE_BRANCH"
+done
+
+# Discovery is one bounded pass and never starts after the discovery cutoff.
+if before "$discovery_epoch" && (( created_issues < MAX_DISCOVERY_ISSUES )); then
+  log "queue pass complete; starting bounded discovery"
+  git checkout "$BASE_BRANCH"
+  git reset --hard "origin/$BASE_BRANCH"
+  mkdir -p .codex-automation
+  printf '{"items":[]}\n' > .codex-automation/discoveries.json
+
+  discovery_prompt="Inspect this repository for concrete bugs, test/quality gaps, and UX problems. Do not edit project files. Write at most $MAX_DISCOVERY_ISSUES evidence-based findings to .codex-automation/discoveries.json using the schema described in AGENTS.md or the nightly contract. Do not invent work. Avoid duplicates you can identify locally."
+
+  run_codex "$discovery_prompt" "discovery" || true
+
+  if jq -e '.items | type == "array"' .codex-automation/discoveries.json >/dev/null 2>&1; then
+    while IFS= read -r item; do
+      (( created_issues >= MAX_DISCOVERY_ISSUES )) && break
+      type="$(jq -r '.type // "quality"' <<<"$item")"
+      title="$(jq -r '.title' <<<"$item")"
+      summary="$(jq -r '.summary' <<<"$item")"
+      evidence="$(jq -r '.evidence' <<<"$item")"
+      acceptance="$(jq -r '.suggested_acceptance // ""' <<<"$item")"
+
+      [[ -n "$title" && "$title" != "null" ]] || continue
+
+      # Cheap duplicate guard using title search.
+      if gh issue list --repo "$TARGET_REPO" --state all --search "$title" --limit 5 --json title --jq '.[].title' | grep -Fqi "$title"; then
+        log "discovery duplicate skipped: $title"
+        continue
+      fi
+
+      labels="nightly:discovered"
+      [[ "$AUTO_QUEUE_DISCOVERIES" == "true" && "$type" != "idea" ]] && labels="$labels,$QUEUE_LABEL"
+
+      gh issue create         --repo "$TARGET_REPO"         --title "[$type] $title"         --label "$labels"         --body "Discovered by codex-automation during the $night_date nightly run.
+
+## Summary
+$summary
+
+## Evidence
+$evidence
+
+## Suggested acceptance criteria
+$acceptance"
+
+      created_issues=$((created_issues + 1))
+    done < <(jq -c '.items[]' .codex-automation/discoveries.json)
+  fi
+  rm -rf .codex-automation
+fi
+
+log "entering wrap-up"
+git checkout "$BASE_BRANCH" >/dev/null 2>&1 || true
+
+cat > "$report" <<EOF
+# Nightly report - $night_date
+
+- Repository: $TARGET_REPO
+- Model: $MODEL
+- Implemented / PR opened: $implemented
+- Blocked: $blocked
+- Discovery issues created: $created_issues
+- Validation command: `$VALIDATE_CMD`
+- Hard stop: $(date -d "@$hard_epoch" --iso-8601=seconds)
+
+Artifacts for this run are stored next to this report.
+EOF
+
+log "report=$report"
+log "done implemented=$implemented blocked=$blocked discovered=$created_issues"
