@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate shell syntax
+        run: |
+          bash -n scripts/install.sh
+          bash -n scripts/codex-nightly
+
+      - name: Prepare installed path for systemd verification
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 scripts/codex-nightly "$HOME/.local/bin/codex-nightly"
+
+      - name: Validate systemd units
+        run: |
+          systemd-analyze verify systemd/codex-nightly.service
+          systemd-analyze verify systemd/codex-nightly.timer

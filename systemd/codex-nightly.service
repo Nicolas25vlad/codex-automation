@@ -1,0 +1,17 @@
+[Unit]
+Description=Codex nightly autonomous coding runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/codex-nightly
+Restart=no
+TimeoutStopSec=2min
+KillSignal=SIGTERM
+
+# Final fuse. The runner also enforces an absolute wall-clock cutoff.
+RuntimeMaxSec=8h
+
+[Install]
+WantedBy=default.target
