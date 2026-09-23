@@ -4,6 +4,8 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="$HOME/.local/bin"
 CFG_DIR="$HOME/.config/codex-automation"
+DATA_DIR="$HOME/.local/share/codex-automation"
+STATE_DIR="$HOME/.local/state/codex-automation"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 
 need=(git gh codex jq timeout systemctl)
@@ -18,9 +20,10 @@ if (("${#missing[@]}" > 0)); then
   exit 1
 fi
 
-mkdir -p "$BIN_DIR" "$CFG_DIR" "$SYSTEMD_DIR"
+mkdir -p "$BIN_DIR" "$CFG_DIR" "$DATA_DIR" "$STATE_DIR" "$SYSTEMD_DIR"
 
 install -m 0755 "$ROOT/scripts/codex-nightly" "$BIN_DIR/codex-nightly"
+install -m 0644 "$ROOT/prompts/nightly.md" "$DATA_DIR/nightly.md"
 install -m 0644 "$ROOT/systemd/codex-nightly.service" "$SYSTEMD_DIR/codex-nightly.service"
 install -m 0644 "$ROOT/systemd/codex-nightly.timer" "$SYSTEMD_DIR/codex-nightly.timer"
 
@@ -28,8 +31,6 @@ if [[ ! -f "$CFG_DIR/config.env" ]]; then
   cp "$ROOT/config/config.env.example" "$CFG_DIR/config.env"
   chmod 0600 "$CFG_DIR/config.env"
 fi
-
-mkdir -p "$HOME/.local/share/codex-automation" "$HOME/.local/state/codex-automation"
 
 systemctl --user daemon-reload
 
