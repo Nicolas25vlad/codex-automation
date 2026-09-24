@@ -7,11 +7,23 @@ Wants=network-online.target
 Type=simple
 ExecStart=%h/.local/bin/codex-nightly
 Restart=no
-TimeoutStopSec=2min
-KillSignal=SIGTERM
 
-# Final fuse. The runner also enforces an absolute wall-clock cutoff.
-RuntimeMaxSec=8h
+# Stop the entire process tree, including Gradle/Codex children.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=2min
+
+# Default schedule is 23:30 -> 07:00. The runner also enforces HARD_STOP
+# internally; this is an independent fuse for the bundled timer.
+RuntimeMaxSec=7h30m
+
+# Be polite to a small homelab while builds run overnight.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# Logs and state can contain repository details.
+UMask=0077
 
 [Install]
 WantedBy=default.target
