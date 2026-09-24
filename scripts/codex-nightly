@@ -417,10 +417,7 @@ publish_issue_work() {
 
 Run ID: $run_id
 
-Validation:
-```
-$VALIDATE_CMD
-```
+Validation command: $VALIDATE_CMD
 
 This PR is intentionally draft and was not merged automatically.")"; then
     github_errors=$((github_errors + 1))
