@@ -460,7 +460,7 @@ if [[ "$MODE" != "discover-only" ]]; then
   done
 fi
 
-if before "$discovery_epoch" && (( created_issues < MAX_DISCOVERY_ISSUES )); then
+if [[ "$MODE" != "once" ]] && before "$discovery_epoch" && (( created_issues < MAX_DISCOVERY_ISSUES )); then
   hard_guard
   set_phase "discovery"
   log "starting bounded discovery"
