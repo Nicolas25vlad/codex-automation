@@ -220,6 +220,7 @@ git reset --hard "origin/$BASE_BRANCH"
 hard_guard
 
 cp "$HOME/.local/share/codex-automation/nightly.md" "$run_dir/nightly-prompt.md"
+cp "$HOME/.local/share/codex-automation/discovery.md" "$run_dir/discovery-prompt.md"
 
 ensure_label() {
   gh_write label create "$1" --repo "$TARGET_REPO" --color "$2" --description "$3" 2>/dev/null || true
@@ -470,7 +471,10 @@ if [[ "$MODE" != "once" ]] && before "$discovery_epoch" && (( created_issues < M
   mkdir -p .codex-automation
   printf '{"items":[]}\n' > .codex-automation/discoveries.json
 
-  discovery_prompt="Inspect this repository for concrete bugs, test/quality gaps, and UX problems. Do not edit project files. Write at most $MAX_DISCOVERY_ISSUES evidence-based findings to .codex-automation/discoveries.json. The file must be valid JSON with this exact shape: {\"items\":[{\"type\":\"bug|quality|ux|idea\",\"title\":\"short title\",\"summary\":\"what is wrong or could improve\",\"evidence\":\"concrete file, behavior, or command evidence\",\"suggested_acceptance\":\"how a future agent can verify the fix\"}]}. Do not invent work. Avoid duplicates. Do not modify any other files."
+  discovery_template="$HOME/.local/share/codex-automation/discovery.md"
+  [[ -f "$discovery_template" ]] || { log "discovery prompt not installed: $discovery_template"; exit 2; }
+  discovery_prompt="$(cat "$discovery_template")"
+  discovery_prompt="${discovery_prompt//\{\{MAX_DISCOVERY_ISSUES\}\}/$MAX_DISCOVERY_ISSUES}"
 
   run_codex "$discovery_prompt" "discovery" || true
   if before "$hard_epoch"; then
