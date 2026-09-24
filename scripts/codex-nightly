@@ -62,10 +62,12 @@ done
 
 for n in MAX_ISSUES_PER_NIGHT MAX_DISCOVERY_ISSUES MAX_VALIDATION_SECONDS GH_TIMEOUT_SECONDS GIT_TIMEOUT_SECONDS; do
   value="${!n}"
-  [[ "$value" =~ ^[0-9]+$ ]] && (( value > 0 )) || {
+  if [[ "$value" =~ ^[0-9]+$ ]] && (( value > 0 )); then
+    :
+  else
     echo "$n must be a positive integer" >&2
     exit 2
-  }
+  fi
 done
 
 gh auth status >/dev/null 2>&1 || { echo "gh is not authenticated" >&2; exit 2; }
@@ -413,7 +415,7 @@ publish_issue_work() {
   hard_guard
   if ! pr_url="$(gh_write pr create     --repo "$TARGET_REPO"     --base "$BASE_BRANCH"     --head "$branch_name"     --draft     --title "nightly: #$num $title"     --body "Automated overnight implementation for #$num.
 
-Run: `$run_id`
+Run ID: $run_id
 
 Validation:
 ```
@@ -427,7 +429,7 @@ This PR is intentionally draft and was not merged automatically.")"; then
     return
   fi
 
-  gh_write issue comment "$num" --repo "$TARGET_REPO" --body "Nightly run `$run_id` opened draft PR: $pr_url" >/dev/null 2>&1 || github_errors=$((github_errors + 1))
+  gh_write issue comment "$num" --repo "$TARGET_REPO" --body "Nightly run $run_id opened draft PR: $pr_url" >/dev/null 2>&1 || github_errors=$((github_errors + 1))
   gh_write issue edit "$num" --repo "$TARGET_REPO" --remove-label "$QUEUE_LABEL" --add-label "nightly:pr-open" >/dev/null 2>&1 || github_errors=$((github_errors + 1))
 
   implemented=$((implemented + 1))
@@ -493,18 +495,18 @@ jq -n   --arg run_id "$run_id"   --arg repository "$TARGET_REPO"   --arg model "
 {
   echo "# Nightly report - $night_date"
   echo
-  echo "- Run ID: `$run_id`"
-  echo "- Repository: `$TARGET_REPO`"
-  echo "- Model: `$MODEL`"
-  echo "- Mode: `$MODE`"
+  echo "- Run ID: $run_id"
+  echo "- Repository: $TARGET_REPO"
+  echo "- Model: $MODEL"
+  echo "- Mode: $MODE"
   echo "- Implemented / PR opened: $implemented"
   echo "- Blocked: $blocked"
   echo "- Discovery issues created: $created_issues"
   echo "- GitHub side-effect errors: $github_errors"
-  echo "- Validation: `$VALIDATE_CMD`"
+  echo "- Validation: $VALIDATE_CMD"
   echo "- Hard stop: $(date -d "@$hard_epoch" --iso-8601=seconds)"
   if [[ -n "$recovered_stash" ]]; then
-    echo "- Recovered interrupted changes: `$recovered_stash`"
+    echo "- Recovered interrupted changes: $recovered_stash"
   fi
   echo
   echo "## Draft PRs"
