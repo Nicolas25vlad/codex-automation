@@ -1,61 +1,101 @@
 # codex-automation
 
-Nightly autonomous Codex runner for a self-hosted Linux machine.
+A conservative overnight supervisor for Codex on a self-hosted Linux machine.
 
-The first target is an Android project: an agent works through a GitHub issue queue overnight, validates its changes, opens draft PRs, discovers bugs/improvements, and stops at a hard morning cutoff.
+It turns a GitHub issue queue into bounded unattended coding work: Codex implements one issue at a time, deterministic checks validate the result, successful work becomes a draft PR, new bugs/improvements become issues, and the entire process stops before the morning cutoff.
 
-## What it does
+The first real target is the Marvel Android project, but the runner is repository-agnostic.
 
-- starts from a systemd user timer (default: 23:30)
-- clones/updates a target GitHub repository into a dedicated workspace
-- reads open issues carrying the configured queue label
-- gives one issue at a time to `codex exec --json`
-- keeps GitHub credentials outside the Codex sandbox
-- runs project validation before publishing work
-- pushes a dedicated branch and opens a draft PR
-- marks blocked work instead of looping forever
-- when the queue is empty, runs a bounded discovery pass for bugs, quality issues and UX improvements
-- creates new GitHub issues from structured discovery output
-- enters wrap-up mode before the deadline
-- hard-stops at 07:00 even if Codex is still running
-- stores JSONL traces and a nightly report for review
+## Design goals
 
-## Two operating modes
+- useful work while nobody is watching
+- GitHub as the durable queue and review surface
+- strict wall-clock and work-count budgets
+- no automatic merges
+- narrow Codex sandbox by default
+- GitHub credentials kept outside the Codex process
+- deterministic validation before publication
+- recoverable interruptions
+- machine-readable traces for morning review
+- a clean path to Codex/ChatGPT Remote without pretending batch sessions are native Remote chats
 
-### 1. Batch mode: recommended for unattended Linux
+## Night lifecycle
 
-This repository installs a systemd user timer and a runner around `codex exec`.
+```text
+23:30  start
+  |
+  +-- preflight + lock
+  +-- recover interrupted managed checkout if needed
+  |
+  +-- queue loop
+  |     |
+  |     +-- read one "nightly" issue
+  |     +-- create isolated branch
+  |     +-- codex exec --json
+  |     +-- deterministic validation
+  |     +-- commit + push
+  |     +-- draft PR
+  |     +-- collect side discoveries
+  |
+  +-- no queued work?
+  |     |
+  |     +-- bounded discovery pass
+  |     +-- deduplicate findings
+  |     +-- create GitHub issues
+  |
+06:15  no new discovery
+06:30  no new implementation
+07:00  hard stop
+```
 
-This is the mode with the strongest operational guarantees: deterministic start time, hard cutoff, bounded issue count, logs, validation and PR handoff.
+The bundled systemd service also has an independent 7h30 runtime fuse for the default 23:30 schedule.
 
-### 2. Codex Remote mode: recommended when live supervision matters most
+## Safety model
 
-Codex Remote can expose live project context, terminal output, diffs, tests, approvals and supported Codex threads in the ChatGPT/Codex apps. For a Linux homelab today, the supported route is to add the Linux box as a **Remote SSH** project from a supported Codex desktop host.
+The Codex process defaults to:
 
-Direct Linux-host pairing is not currently the supported Remote path, so a background `codex exec` launched by systemd is **not guaranteed to appear as a first-class Remote chat**. See [docs/REMOTE.md](docs/REMOTE.md).
+```text
+sandbox: workspace-write
+approval policy: never
+```
 
-The JSONL trace remains available even when a run is not represented as a Remote thread.
+For unattended execution, `never` means the agent does not pause waiting for a human. Operations outside the configured sandbox remain unavailable.
 
-## Install
+The outer runner owns:
 
-Requirements:
+- GitHub reads/writes
+- Git branch lifecycle
+- commits and pushes
+- PR creation
+- final validation
+- deadlines and process termination
 
-- Linux with systemd
-- Git
-- GitHub CLI (`gh`)
-- OpenAI Codex CLI
-- `jq`
-- GNU `timeout`
-- SSH access if you want Codex Remote
+Codex owns:
 
-Authenticate first:
+- repository inspection
+- implementation
+- local project commands allowed by the sandbox
+- structured discovery output
+
+The runner never auto-merges a PR.
+
+## Quick start
+
+### Arch Linux prerequisites
+
+```bash
+sudo pacman -S --needed git github-cli jq coreutils util-linux bubblewrap nodejs npm
+npm install -g @openai/codex@latest
+```
+
+Authenticate:
 
 ```bash
 gh auth login
 codex login
 ```
 
-Then:
+Install:
 
 ```bash
 git clone https://github.com/Nicolas25vlad/codex-automation.git
@@ -69,7 +109,28 @@ Edit:
 nano ~/.config/codex-automation/config.env
 ```
 
-For the Marvel Android project, set for example:
+Run the preflight:
+
+```bash
+codex-doctor
+```
+
+Run exactly one queued issue before enabling the timer:
+
+```bash
+codex-nightly --once
+```
+
+Then enable the nightly schedule:
+
+```bash
+systemctl --user enable --now codex-nightly.timer
+sudo loginctl enable-linger "$USER"
+```
+
+## Default Marvel config
+
+The sample config is already pointed at:
 
 ```bash
 TARGET_REPO="Nicolas25vlad/projeto-android-marvel"
@@ -78,97 +139,105 @@ MODEL="gpt-6-luna"
 VALIDATE_CMD="./gradlew test lint assembleDebug"
 ```
 
-Test without waiting for the timer:
+Safe discoveries of type `bug`, `quality` and `ux` can be queued for a future night. `idea` findings are created for human review but are never auto-queued.
+
+## Commands
 
 ```bash
+codex-doctor
+codex-nightly --once
+codex-nightly --discover-only
+codex-nightly
 systemctl --user start codex-nightly.service
+systemctl --user stop codex-nightly.service
 journalctl --user -fu codex-nightly.service
 ```
 
-Enable the schedule:
+### `codex-nightly --once`
 
-```bash
-systemctl --user enable --now codex-nightly.timer
-```
+A controlled smoke test:
 
-If the machine has no logged-in user overnight, enable user lingering once:
+- processes at most one queued issue
+- validates and publishes it normally
+- skips discovery
+- exits
 
-```bash
-sudo loginctl enable-linger "$USER"
-```
+### `codex-nightly --discover-only`
 
-## Default night
+Skips implementation and performs one bounded discovery pass.
 
-```text
-23:30 start
-  |
-  +-- GitHub issue queue
-  |     |
-  |     +-- Codex implementation
-  |     +-- validation
-  |     +-- commit + push
-  |     +-- draft PR
-  |
-  +-- no queued issue?
-  |     |
-  |     +-- bounded discovery
-  |     +-- create issues
-  |
-06:15 stop discovery
-06:30 stop starting implementation
-06:30-07:00 wrap-up
-07:00 hard stop
-```
+## Queue labels
 
-## Queue model
-
-The runner uses labels:
+The runner creates and uses:
 
 - `nightly`: eligible for implementation
-- `nightly:pr-open`: implementation produced a PR
-- `nightly:blocked`: agent or validation could not finish safely
-- `nightly:discovered`: issue was created by discovery
+- `nightly:pr-open`: a draft PR was produced
+- `nightly:blocked`: human attention is required
+- `nightly:discovered`: created from automated discovery
+- `kind:bug`
+- `kind:quality`
+- `kind:ux`
+- `kind:idea`
 
-Discovery is capped. New findings are not allowed to grow an unbounded self-feeding backlog in one night.
+A blocked issue is removed from the automatic queue so one bad task cannot eat every night.
 
-## Safety model
+## Observability
 
-The Codex process defaults to:
-
-```text
-sandbox: workspace-write
-approval policy: never
-```
-
-The runner, not Codex, performs authenticated GitHub actions. This reduces how much credential-bearing network access the model needs.
-
-Do not point this at production infrastructure or a repository containing secrets.
-
-## Logs
-
-Default location:
+Every invocation gets a unique run ID:
 
 ```text
 ~/.local/state/codex-automation/
-  nightly-YYYY-MM-DD/
-    run.log
-    codex-*.jsonl
-    codex-*.stderr.log
-    discoveries.json
-    NIGHTLY_REPORT.md
+├── latest -> runs/<run-id>
+├── runner.lock
+└── runs/
+    └── <run-id>/
+        ├── state.json
+        ├── summary.json
+        ├── NIGHTLY_REPORT.md
+        ├── run.log
+        ├── nightly-prompt.md
+        ├── codex-*.jsonl
+        ├── codex-*.stderr.log
+        ├── prs.tsv
+        ├── discoveries.tsv
+        └── blocked.tsv
 ```
 
-Watch live:
+Useful commands:
 
 ```bash
-journalctl --user -fu codex-nightly.service
+watch -n 2 cat ~/.local/state/codex-automation/latest/state.json
+cat ~/.local/state/codex-automation/latest/summary.json
+cat ~/.local/state/codex-automation/latest/NIGHTLY_REPORT.md
 ```
 
-## Manual stop
+`codex exec --json` provides structured JSONL events suitable for later metrics and dashboards.
 
-```bash
-systemctl --user stop codex-nightly.service
-```
+## Interrupted runs
+
+The automation checkout is marked as runner-managed.
+
+If a run is killed while edits are present, the next run preserves tracked/untracked work with a recovery stash instead of deleting it, then resets to the configured base branch.
+
+The runner refuses to auto-recover a dirty checkout that is not marked as automation-managed.
+
+The batch checkout is intentionally separate from your normal human checkout.
+
+## ChatGPT / Codex Remote
+
+Git synchronization and session synchronization are different things.
+
+Batch mode guarantees unattended Linux execution, JSONL traces, reports, GitHub issues and PRs. OpenAI does not document that an arbitrary systemd-launched `codex exec` process will automatically appear as a native Remote chat.
+
+For native phone/desktop supervision, use Codex Remote on a supported desktop host and connect to the Linux homelab/project through the Remote workflow. Remote is the surface for live steering, diffs, tests, terminal output and persistent Codex work.
+
+See [docs/REMOTE.md](docs/REMOTE.md).
+
+## Documentation
+
+- [Operations runbook](docs/OPERATIONS.md)
+- [Architecture and trust boundaries](docs/ARCHITECTURE.md)
+- [Codex / ChatGPT Remote](docs/REMOTE.md)
 
 ## Repository structure
 
@@ -179,17 +248,21 @@ systemctl --user stop codex-nightly.service
 │   └── config.env.example
 ├── docs/
 │   ├── ARCHITECTURE.md
+│   ├── OPERATIONS.md
 │   └── REMOTE.md
 ├── prompts/
 │   └── nightly.md
 ├── scripts/
-│   ├── install.sh
-│   └── codex-nightly
+│   ├── codex-doctor
+│   ├── codex-nightly
+│   └── install.sh
 └── systemd/
     ├── codex-nightly.service
     └── codex-nightly.timer
 ```
 
-## Status
+## Current scope
 
-v1 is intentionally single-agent. Parallel worktrees can come later after the single-runner workflow proves reliable.
+v2 remains deliberately single-agent.
+
+The next safe scaling step is multiple independent worktrees with a central scheduler, not multiple agents sharing one checkout.
