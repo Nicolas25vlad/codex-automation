@@ -14,10 +14,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install static analysis
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
       - name: Validate shell syntax
         run: |
           bash -n scripts/install.sh
           bash -n scripts/codex-nightly
+          bash -n scripts/codex-doctor
+
+      - name: ShellCheck
+        run: |
+          shellcheck scripts/install.sh
+          shellcheck scripts/codex-nightly
+          shellcheck scripts/codex-doctor
+
+      - name: Smoke-test offline doctor
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/bin/codex"
+          chmod +x "$RUNNER_TEMP/bin/codex"
+          PATH="$RUNNER_TEMP/bin:$PATH" \
+            CODEX_AUTOMATION_CONFIG="$PWD/config/config.env.example" \
+            scripts/codex-doctor --offline
 
       - name: Prepare installed path for systemd verification
         run: |
