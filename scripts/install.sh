@@ -25,6 +25,7 @@ mkdir -p "$BIN_DIR" "$CFG_DIR" "$DATA_DIR" "$STATE_DIR" "$SYSTEMD_DIR"
 install -m 0755 "$ROOT/scripts/codex-nightly" "$BIN_DIR/codex-nightly"
 install -m 0755 "$ROOT/scripts/codex-doctor" "$BIN_DIR/codex-doctor"
 install -m 0644 "$ROOT/prompts/nightly.md" "$DATA_DIR/nightly.md"
+install -m 0644 "$ROOT/prompts/discovery.md" "$DATA_DIR/discovery.md"
 install -m 0644 "$ROOT/systemd/codex-nightly.service" "$SYSTEMD_DIR/codex-nightly.service"
 install -m 0644 "$ROOT/systemd/codex-nightly.timer" "$SYSTEMD_DIR/codex-nightly.timer"
 
