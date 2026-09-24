@@ -1,0 +1,54 @@
+name: Nightly task
+description: Queue a bounded task for the overnight Codex runner
+title: "[nightly] "
+labels:
+  - nightly
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep the task narrow enough for one autonomous implementation turn plus deterministic validation.
+
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: What should be true when this issue is complete?
+      placeholder: "Implement..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Relevant files, screens, behavior or prior decisions.
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Concrete checks the agent can use to know the task is done.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints / do not change
+      description: Architecture, UX, APIs or files that must remain untouched.
+    validations:
+      required: false
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Extra validation
+      description: Optional checks beyond the repository-level VALIDATE_CMD.
+    validations:
+      required: false

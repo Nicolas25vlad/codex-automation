@@ -1,52 +1,209 @@
 # Architecture
 
+## Overview
+
+codex-automation is a single-agent overnight supervisor.
+
+It deliberately separates **task orchestration**, **model execution**, **Git/GitHub publication**, and **observation** so that the model is not responsible for enforcing its own safety or deadlines.
+
+```text
+systemd timer
+    |
+    v
+codex-nightly supervisor
+    |
+    +--> GitHub queue (gh)
+    |
+    +--> managed batch checkout
+    |       |
+    |       +--> codex exec --json
+    |       +--> deterministic validation
+    |
+    +--> Git commit / push / draft PR
+    |
+    +--> reports + JSONL + state.json
+```
+
 ## Trust boundaries
 
-The runner deliberately separates three responsibilities.
+### Codex process
 
-### Codex
+Codex receives:
 
-Codex edits and tests the checked-out project in a workspace-write sandbox. It does not need the GitHub token to implement an issue.
+- the target repository checkout
+- the selected issue
+- project-local instructions
+- workspace-write access
 
-### Runner
+Codex does not need the GitHub token to implement an issue.
 
-The runner owns scheduling, deadlines, Git state, validation, GitHub issue mutations, pushes and PR creation.
+The default approval policy is `never`, so an unattended run cannot stop waiting for a human approval prompt. Requests outside the sandbox remain unavailable instead.
+
+### Supervisor
+
+The Bash supervisor owns:
+
+- exclusive run lock
+- schedule and cutoff calculations
+- GitHub issue selection
+- Git branch creation
+- network timeouts
+- final validation
+- commits and pushes
+- draft PR creation
+- discovery issue publication
+- recovery of interrupted work
+- per-run state and reports
+
+### systemd
+
+systemd is the independent process-level fuse.
+
+For the bundled 23:30 timer, `RuntimeMaxSec=7h30m` reaches the 07:00 morning boundary. `KillMode=control-group` ensures descendants such as Codex and Gradle are part of the stop operation.
+
+The script also enforces its configured `HARD_STOP` and bounds long subprocesses.
 
 ### GitHub
 
-GitHub is the durable task and review surface. Issues define work; draft PRs expose results.
+GitHub is the durable coordination surface:
 
-## Lifecycle
+- issues define candidate work
+- labels define automation state
+- remote branches preserve successful commits
+- draft PRs expose reviewable results
 
-1. systemd starts the runner.
-2. runner calculates the next absolute 07:00 cutoff.
-3. runner creates/updates the dedicated target checkout.
-4. runner ensures standard labels exist.
-5. runner selects a queued issue.
-6. runner creates a branch from the configured base branch.
-7. runner invokes `codex exec --json` with a deadline enforced by GNU `timeout`.
-8. runner executes `VALIDATE_CMD`.
-9. successful work is committed, pushed and opened as a draft PR.
-10. blocked work is labeled and reported.
-11. when the queue is empty, discovery may run until the discovery cutoff.
-12. discovery output is parsed and deduplicated before issues are created.
-13. wrap-up begins at the configured time.
-14. at 07:00 the active Codex child is terminated even if it has not finished.
+No automatic merge is performed.
 
-## Why GitHub access lives outside Codex
+## Run state machine
 
-An unattended coding agent does not need broad authenticated network access merely to edit a local checkout.
+```text
+preflight
+   |
+   v
+queue
+   |
+   +--> implementing-issue-N
+   |          |
+   |          v
+   |    validating-issue-N
+   |          |
+   |          v
+   |    publishing-issue-N
+   |
+   +--> discovery
+   |
+   v
+wrap-up
+   |
+   v
+complete
+```
 
-Keeping `gh` calls in the supervisor:
+The active phase is written atomically to `state.json`.
 
-- reduces secret exposure to agent-generated commands
-- makes issue/PR side effects explicit
-- makes retries easier
-- lets the Codex sandbox remain narrower
-- keeps policy deterministic
+## Managed checkout
 
-## Why v1 is single-agent
+Batch work lives under:
 
-Parallel worktrees are straightforward technically, but they multiply failure modes: duplicate issue selection, branch collisions, simultaneous Gradle load, token bursts and harder morning review.
+```text
+~/.local/share/codex-automation/repos/OWNER/REPO
+```
 
-v1 intentionally proves the lifecycle first. A future v2 can introduce a worker pool once one agent behaves reliably.
+The checkout contains an internal marker:
+
+```text
+.git/codex-automation-managed
+```
+
+A clean legacy checkout under the managed path can be adopted.
+
+A dirty checkout without that marker is never automatically reset.
+
+## Interrupted-run recovery
+
+If a managed checkout is dirty at the beginning of a new run, the supervisor preserves tracked and untracked changes using:
+
+```text
+git stash push -u
+```
+
+The resulting stash is recorded in the run artifacts.
+
+This lets a 07:00 termination remain aggressive without making the next night unrecoverable.
+
+## Time budgets
+
+There are several independent limits:
+
+- `MAX_ISSUES_PER_NIGHT`
+- `MAX_DISCOVERY_ISSUES`
+- `MAX_VALIDATION_SECONDS`
+- `GH_TIMEOUT_SECONDS`
+- `GIT_TIMEOUT_SECONDS`
+- `DISCOVERY_STOP`
+- `WRAP_START`
+- `HARD_STOP`
+- systemd `RuntimeMaxSec`
+
+The goal is graceful degradation: one slow Gradle build, broken network request or difficult issue must not consume the entire night.
+
+## GitHub mutation policy
+
+Read-only GitHub operations may be retried.
+
+Non-idempotent writes are deliberately not blindly retried because a timeout after a successful server-side write can otherwise create duplicate issues or PRs.
+
+Non-critical GitHub side-effect failures are counted in `summary.json`.
+
+## Discovery
+
+Codex writes findings into a runner-owned side channel:
+
+```text
+.codex-automation/discoveries.json
+```
+
+The supervisor:
+
+1. validates the JSON shape
+2. normalizes finding type
+3. searches for likely title duplicates
+4. publishes a bounded number of issues
+5. optionally queues safe categories for a future night
+
+`idea` findings are never automatically queued.
+
+## Validation boundary
+
+Codex may run project checks during implementation, but publication depends on an outer deterministic `VALIDATE_CMD`.
+
+A failed final validation:
+
+- prevents publication as successful work
+- preserves a binary diff patch in run artifacts
+- marks the issue blocked
+- removes it from the automatic queue
+
+## Observability
+
+Each invocation gets a unique run directory and a `latest` symlink.
+
+Human-readable:
+
+- `NIGHTLY_REPORT.md`
+- `run.log`
+
+Machine-readable:
+
+- `state.json`
+- `summary.json`
+- Codex JSONL
+- TSV ledgers for PRs, discoveries and blocked work
+
+The JSONL stream contains exposed Codex events, not private hidden chain-of-thought.
+
+## Scaling
+
+v2 remains single-agent by design.
+
+The safe v3 scaling unit is an independent Git worktree per worker behind a central scheduler. Multiple agents must never share a writable checkout.

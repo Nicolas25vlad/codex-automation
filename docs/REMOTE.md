@@ -1,76 +1,157 @@
 # Codex / ChatGPT Remote
 
-The goal of Remote is different from Git synchronization.
+codex-automation has two different kinds of synchronization:
 
-Git synchronizes code. Remote synchronizes the live Codex experience: supported threads, project context, terminal output, diffs, tests, approvals and steering controls.
+1. **work synchronization**: code, issues, commits, draft PRs and reports
+2. **session synchronization**: a live Codex thread that can be viewed and steered from Remote
 
-## Current practical setup for a Linux homelab
+They are intentionally treated as separate capabilities.
 
-Direct Linux-host Remote pairing is not currently the documented supported path. Use a supported Codex desktop host and add the homelab through **Remote SSH**.
+## Batch mode
 
-Recommended topology:
+The systemd runner launches `codex exec --json` on the Linux homelab.
+
+This mode guarantees the things codex-automation controls itself:
+
+- wall-clock scheduling
+- issue selection
+- local implementation
+- deterministic validation
+- JSONL event traces
+- Git commits and draft PRs
+- discovery issues
+- recovery after interruption
+- a hard morning stop
+
+A batch run is observable through:
+
+```bash
+journalctl --user -fu codex-nightly.service
+watch -n 2 cat ~/.local/state/codex-automation/latest/state.json
+less ~/.local/state/codex-automation/latest/codex-*.jsonl
+```
+
+## Native Remote experience
+
+OpenAI's Remote experience is designed as a control plane for coding work running on development machines. It can expose supported Codex threads, terminal/test activity, diffs, review and steering controls to the ChatGPT mobile app.
+
+Use this when the requirement is:
+
+> I want to open ChatGPT on my phone at 03:00 and actively inspect or steer the coding session.
+
+The documented desktop Codex experience is currently on macOS and Windows. A Linux homelab can still be the machine that stores/builds the code by using the supported remote-host/SSH workflow from that desktop environment.
+
+Conceptually:
 
 ```text
-ChatGPT mobile Remote
-        |
-secure Codex relay
-        |
-Codex desktop on Windows/macOS
-        |
-Remote SSH project
-        |
+ChatGPT mobile
+      |
+ Codex Remote
+      |
+supported Codex desktop host
+      |
+ remote host / SSH
+      |
 Linux homelab
-        |
-Marvel repository
+      |
+human/Remote checkout
 ```
 
-The Codex desktop app can detect SSH hosts from your SSH configuration and open projects on the remote machine.
-
-Example SSH config on the desktop machine:
-
-```sshconfig
-Host homelab
-    HostName YOUR_HOMELAB_IP_OR_DNS
-    User vlad
-    IdentityFile ~/.ssh/id_ed25519
-```
-
-Then add the target checkout created by this project as a Remote SSH project.
-
-By default it lives under:
+Keep that human/Remote checkout separate from the batch checkout:
 
 ```text
-~/.local/share/codex-automation/repos/<owner>/<repo>
+batch:
+~/.local/share/codex-automation/repos/OWNER/REPO
+
+human/Remote:
+~/src/REPO
 ```
+
+The batch runner is allowed to reset/recover its own checkout. Your human checkout should never be subject to that lifecycle.
 
 ## Important limitation
 
-The batch runner starts `codex exec` from systemd. The Codex CLI records structured run data and this project saves JSONL traces, but OpenAI does not document a guarantee that every externally launched background `codex exec` run will appear as a first-class Remote chat in the desktop/mobile UI.
+OpenAI documents `codex exec` as the right primitive for scripts, CI and bounded background tasks, and Remote as the native control surface for interactive/persistent Codex work.
 
-Therefore:
+It is **not documented that an arbitrary `codex exec` process launched externally by systemd will automatically become a first-class Remote chat**.
 
-- **Guaranteed unattended behavior:** use this repository's batch mode.
-- **Guaranteed native Remote UX:** start the work as a Codex Remote thread/automation/Goal on the SSH project.
-- **Guaranteed audit trail for batch mode:** use JSONL traces, systemd logs, Git commits, GitHub issues and draft PRs.
+Therefore codex-automation does not:
 
-Do not build automation around undocumented files inside `~/.codex` just to force a chat to appear. Those are implementation details and can change.
+- copy internal files from `~/.codex`
+- edit private Codex databases
+- forge thread/session identifiers
+- depend on undocumented ChatGPT storage formats
 
-## Best workflow today
+Those approaches would be brittle and could corrupt state.
 
-For normal nights, let the Linux runner do the work and use GitHub + JSONL as the durable record.
+## What JSONL gives you
 
-When you specifically want to watch and steer a long run from the ChatGPT app:
+`codex exec --json` emits structured events. codex-automation keeps them verbatim per run.
 
-1. Open the homelab repository as a Remote SSH project in Codex desktop.
-2. Start a Codex thread there.
-3. Turn the objective into a Goal if it is multi-turn.
-4. Use the ChatGPT mobile Remote tab to inspect progress, diffs, terminal/test output and to steer or approve.
-5. Keep the 07:00 boundary in the automation/goal instructions and use OS-level supervision for any runner-managed job.
+That provides an audit trail of useful observable activity such as:
 
-## What “see what it thought” means
+- tool/command events exposed by the CLI
+- command output
+- task progress events
+- final agent output
+- failures and timing
 
-Remote and JSONL can expose useful progress, tool activity, commands, outputs, diffs, test results and model-visible summaries. They do not expose private hidden chain-of-thought.
+It does **not** expose private hidden chain-of-thought.
 
-## Future direction
+## Advanced: Codex app-server / SDK
 
-If direct Linux Remote hosting becomes officially supported, this repository can make the homelab itself the native Remote host and remove the desktop SSH hop.
+OpenAI also exposes the Codex SDK and `codex app-server` for applications that need to start, resume and stream Codex tasks programmatically.
+
+These are a future direction for codex-automation if it grows from a shell supervisor into a service with its own live control UI.
+
+They are not required for v2.
+
+## Advanced: self-hosted Agents API environment
+
+OpenAI's Agents API can connect a self-hosted environment using:
+
+```text
+codex exec-server --remote ...
+```
+
+The executor connects outbound over WebSocket, receives agent shell/file operations and returns results.
+
+This is useful if a future version wants an API-owned agent session whose compute runs on the homelab.
+
+It is a different architecture from the current `codex exec` batch runner and should not be treated as proof that its sessions automatically appear in ChatGPT Remote.
+
+## Recommended workflow today
+
+### Normal unattended night
+
+Use the batch runner.
+
+Morning review comes from:
+
+1. `NIGHTLY_REPORT.md`
+2. draft PRs
+3. discovered issues
+4. `summary.json`
+5. JSONL traces when deeper inspection is useful
+
+### Night where live supervision matters
+
+Start the work from a native Codex Remote-capable project/session rather than expecting systemd batch work to become a Remote thread after the fact.
+
+The OS-level runner can still remain useful as the scheduling/watchdog layer in a future integration, but native session ownership should remain with the documented Codex/Remote surface.
+
+## Future integration target
+
+A future v3 can introduce an optional control-plane adapter:
+
+```text
+scheduler/watchdog
+       |
+       +-- batch adapter -> codex exec
+       |
+       +-- remote adapter -> supported Codex session API/app-server
+       |
+       +-- agents adapter -> self-hosted exec-server
+```
+
+The core queue, validation, reporting and hard-stop logic should remain independent of which Codex transport owns the session.

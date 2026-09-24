@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CFG="${CODEX_AUTOMATION_CONFIG:-$HOME/.config/codex-automation/config.env}"
+OFFLINE=false
+
+if [[ "${1:-}" == "--offline" ]]; then
+  OFFLINE=true
+elif [[ -n "${1:-}" ]]; then
+  echo "Usage: codex-doctor [--offline]" >&2
+  exit 2
+fi
+
+ok=0
+warn=0
+fail=0
+
+pass() { printf '  [OK] %s\n' "$*"; ok=$((ok + 1)); }
+warning() { printf '  [WARN] %s\n' "$*"; warn=$((warn + 1)); }
+failure() { printf '  [FAIL] %s\n' "$*"; fail=$((fail + 1)); }
+
+echo "codex-automation doctor"
+echo
+
+required=(git gh codex jq timeout flock systemctl date)
+for cmd in "${required[@]}"; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    pass "command: $cmd"
+  else
+    failure "missing command: $cmd"
+  fi
+done
+
+if [[ ! -f "$CFG" ]]; then
+  failure "config not found: $CFG"
+  echo
+  printf 'Result: %d ok, %d warnings, %d failures\n' "$ok" "$warn" "$fail"
+  exit 1
+fi
+pass "config exists: $CFG"
+
+# shellcheck disable=SC1090
+source "$CFG"
+
+: "${TARGET_REPO:=}"
+: "${BASE_BRANCH:=main}"
+: "${MODEL:=gpt-6-luna}"
+: "${DISCOVERY_STOP:=06:15}"
+: "${WRAP_START:=06:30}"
+: "${HARD_STOP:=07:00}"
+: "${MAX_ISSUES_PER_NIGHT:=4}"
+: "${MAX_DISCOVERY_ISSUES:=5}"
+: "${MAX_VALIDATION_SECONDS:=1800}"
+: "${WORK_ROOT:=$HOME/.local/share/codex-automation}"
+: "${STATE_ROOT:=$HOME/.local/state/codex-automation}"
+
+if [[ "$TARGET_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  pass "TARGET_REPO format: $TARGET_REPO"
+else
+  failure "TARGET_REPO must be owner/repo"
+fi
+
+for pair in   "MAX_ISSUES_PER_NIGHT:$MAX_ISSUES_PER_NIGHT"   "MAX_DISCOVERY_ISSUES:$MAX_DISCOVERY_ISSUES"   "MAX_VALIDATION_SECONDS:$MAX_VALIDATION_SECONDS"; do
+  name="${pair%%:*}"
+  value="${pair#*:}"
+  if [[ "$value" =~ ^[0-9]+$ ]] && (( value > 0 )); then
+    pass "$name=$value"
+  else
+    failure "$name must be a positive integer"
+  fi
+done
+
+parse_minutes() {
+  local value="$1"
+  if [[ ! "$value" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+    return 1
+  fi
+  local h="${value%%:*}" m="${value##*:}"
+  echo $((10#$h * 60 + 10#$m))
+}
+
+if discovery_min="$(parse_minutes "$DISCOVERY_STOP")" &&
+   wrap_min="$(parse_minutes "$WRAP_START")" &&
+   hard_min="$(parse_minutes "$HARD_STOP")"; then
+  pass "schedule times are valid HH:MM values"
+  if (( discovery_min < wrap_min && wrap_min < hard_min )); then
+    pass "schedule order: discovery < wrap < hard stop"
+  else
+    failure "expected DISCOVERY_STOP < WRAP_START < HARD_STOP"
+  fi
+else
+  failure "invalid schedule time; expected HH:MM"
+fi
+
+mkdir -p "$WORK_ROOT" "$STATE_ROOT"
+if [[ -w "$WORK_ROOT" && -w "$STATE_ROOT" ]]; then
+  pass "work/state directories are writable"
+else
+  failure "work/state directories are not writable"
+fi
+
+available_kb="$(df -Pk "$WORK_ROOT" | awk 'NR==2 {print $4}')"
+if [[ "$available_kb" =~ ^[0-9]+$ ]]; then
+  if (( available_kb >= 5 * 1024 * 1024 )); then
+    pass "disk space: at least 5 GiB free"
+  else
+    warning "less than 5 GiB free under WORK_ROOT"
+  fi
+fi
+
+if systemctl --user show-environment >/dev/null 2>&1; then
+  pass "systemd user manager reachable"
+else
+  warning "systemd user manager is not reachable in this shell"
+fi
+
+if [[ "$OFFLINE" == "false" ]]; then
+  if gh auth status >/dev/null 2>&1; then
+    pass "GitHub CLI authenticated"
+  else
+    failure "GitHub CLI is not authenticated"
+  fi
+
+  if codex login status >/dev/null 2>&1; then
+    pass "Codex CLI authenticated"
+  else
+    failure "Codex CLI is not authenticated"
+  fi
+
+  if [[ "$TARGET_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    if timeout 30s gh repo view "$TARGET_REPO" >/dev/null 2>&1; then
+      pass "GitHub repository is reachable"
+    else
+      failure "cannot access $TARGET_REPO with gh"
+    fi
+
+    if timeout 30s gh api "repos/$TARGET_REPO/branches/$BASE_BRANCH" >/dev/null 2>&1; then
+      pass "base branch exists: $BASE_BRANCH"
+    else
+      failure "base branch not reachable: $BASE_BRANCH"
+    fi
+  fi
+else
+  warning "offline mode: skipped GitHub/Codex authentication and remote repository checks"
+fi
+
+echo
+printf 'Result: %d ok, %d warnings, %d failures\n' "$ok" "$warn" "$fail"
+(( fail == 0 ))
